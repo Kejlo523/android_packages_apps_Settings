@@ -1,0 +1,336 @@
+/*
+ * Copyright (C) 2016 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.android.settings.deviceinfo;
+
+import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.settings.SettingsEnums;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ResolveInfo;
+import android.os.Build;
+import android.os.UserHandle;
+import android.os.UserManager;
+import android.text.BidiFormatter;
+import android.text.TextUtils;
+import android.widget.Toast;
+
+import androidx.annotation.VisibleForTesting;
+import androidx.preference.Preference;
+
+import com.android.internal.logging.nano.MetricsProto.MetricsEvent;
+import com.android.settings.R;
+import com.android.settings.Utils;
+import com.android.settings.biometrics.IdentityCheckBiometricErrorDialog;
+import com.android.settings.core.BasePreferenceController;
+import com.android.settings.core.InstrumentedPreferenceFragment;
+import com.android.settings.overlay.FeatureFactory;
+import com.android.settings.password.ChooseLockSettingsHelper;
+import com.android.settings.password.ConfirmDeviceCredentialActivity;
+import com.android.settingslib.RestrictedLockUtils;
+import com.android.settingslib.RestrictedLockUtilsInternal;
+import com.android.settingslib.core.instrumentation.MetricsFeatureProvider;
+import com.android.settingslib.core.lifecycle.LifecycleObserver;
+import com.android.settingslib.core.lifecycle.events.OnStart;
+import com.android.settingslib.development.DevelopmentSettingsEnabler;
+import com.android.settingslib.utils.StringUtil;
+
+import com.google.android.setupcompat.util.WizardManagerHelper;
+
+import java.util.Random;
+
+public class BuildNumberPreferenceController extends BasePreferenceController implements
+        LifecycleObserver, OnStart {
+
+    static final int TAPS_TO_BE_A_DEVELOPER = 7;
+    static final int REQUEST_CONFIRM_PASSWORD_FOR_DEV_PREF = 100;
+    static final int REQUEST_IDENTITY_CHECK_FOR_DEV_PREF = 101;
+
+    private Activity mActivity;
+    private InstrumentedPreferenceFragment mFragment;
+    private final UserManager mUm;
+    private final MetricsFeatureProvider mMetricsFeatureProvider;
+
+    private Toast mDevHitToast;
+    private RestrictedLockUtils.EnforcedAdmin mDebuggingFeaturesDisallowedAdmin;
+    private boolean mDebuggingFeaturesDisallowedBySystem;
+    private int mDevHitCountdown;
+    private boolean mProcessingLastDevHit;
+
+    public final static java.lang.String[] insults = {
+            "Fake Rising?",
+            "IT'S CLOBBERING TIME!",
+            "Acknowledge me",
+            "You flash ROMs more than you shower",
+            "Maybe clean your room first?",
+            "Nice ROM, still no friends",
+            "Your phone’s stable—you’re not",
+            "Dirty flash, dirty life",
+            "More updates, same boring you",
+            "8080",
+            "Hahaha, n00b!",
+            "What are you doing??",
+            "n00b alert!",
+            "What is this...? Amateur hour!?",
+            "This is not Windows",
+            "Please step away from the device!",
+            "error code: 1D10T",
+            "Go touch some grass",
+            "¯\\_(ツ)_/¯",
+            "Pro tip: Stop doing this",
+            "Perhaps this Android thing is not for you...",
+            "Don't you have anything better to do?",
+            "You're evolving... Just BACKWARDS!",
+            "This won't make you look cooler to your friends",
+            "Go back to your stock ROM",
+            "FBI! OPEN UP!",
+            "Would you prefer iOS next time?",
+            "Your kernel has more bugs than your life",
+            "Installing updates like you have a social life—oh wait",
+            "Your device crashes more than your dating app",
+            "Keep flashing, maybe you'll level up in life",
+            "ROMs over hygiene, classic choice",
+            "Maybe try turning yourself off and on?",
+            "Your phone is custom, your life is generic",
+            "Did you mean to brick it or was that intentional?",
+            "Error 404: Personality not found",
+            "Stop chasing updates, start chasing goals",
+            "Even your battery dies faster than your motivation",
+            "Keep flashing, the world isn’t watching",
+            "You're living in beta, not just your ROM",
+            "Custom recovery, zero self-recovery",
+            "Your device is rooted, your life is not",
+            "Do you even backup your friends?",
+            "Nice try, still a noob",
+            "Your phone has more features than your conversation",
+            "Step away from the flashing tool, human",
+            "ROMs don't fix existential crises",
+            "Congratulations! You just bricked your confidence",
+            "Your Wi-Fi is strong, your willpower is weak",
+            "Keep flashing, maybe one day you'll flash some ambition",
+            "Your device has more personalities than you do",
+            "Stop tweaking, start thinking",
+            "Who needs stability when you can have chaos?",
+            "Your phone is faster than your life choices",
+            "Even AOSP is judging you right now",
+            "Flash responsibly… unlike your decisions",
+            "Your notifications are louder than your achievements"
+    };
+
+    public BuildNumberPreferenceController(Context context, String key) {
+        super(context, key);
+        mUm = (UserManager) context.getSystemService(Context.USER_SERVICE);
+        mMetricsFeatureProvider = FeatureFactory.getFeatureFactory().getMetricsFeatureProvider();
+    }
+
+    public void setHost(InstrumentedPreferenceFragment fragment) {
+        mFragment = fragment;
+        mActivity = fragment.getActivity();
+    }
+
+    @Override
+    public CharSequence getSummary() {
+        return BidiFormatter.getInstance().unicodeWrap(Build.DISPLAY);
+    }
+
+    @Override
+    public void onStart() {
+        mDebuggingFeaturesDisallowedAdmin = RestrictedLockUtilsInternal.checkIfRestrictionEnforced(
+                mContext, UserManager.DISALLOW_DEBUGGING_FEATURES, UserHandle.myUserId());
+        mDebuggingFeaturesDisallowedBySystem = RestrictedLockUtilsInternal.hasBaseUserRestriction(
+                mContext, UserManager.DISALLOW_DEBUGGING_FEATURES, UserHandle.myUserId());
+        mDevHitCountdown = DevelopmentSettingsEnabler.isDevelopmentSettingsEnabled(mContext)
+                ? -1 : TAPS_TO_BE_A_DEVELOPER;
+        mDevHitToast = null;
+    }
+
+    @Override
+    public int getAvailabilityStatus() {
+        return AVAILABLE;
+    }
+
+    @Override
+    public boolean useDynamicSliceSummary() {
+        return true;
+    }
+
+    @Override
+    public boolean handlePreferenceTreeClick(Preference preference) {
+        if (!TextUtils.equals(preference.getKey(), getPreferenceKey())) {
+            return false;
+        }
+        if (isUserAMonkey()) {
+            return false;
+        }
+        // Don't enable developer options for secondary non-demo users.
+        if (!(mUm.isAdminUser() || mUm.isDemoUser())) {
+            mMetricsFeatureProvider.action(
+                    mContext, SettingsEnums.ACTION_SETTINGS_BUILD_NUMBER_PREF);
+            return false;
+        }
+
+        // Don't enable developer options until device has been provisioned
+        if (!WizardManagerHelper.isDeviceProvisioned(mContext)) {
+            mMetricsFeatureProvider.action(
+                    mContext, SettingsEnums.ACTION_SETTINGS_BUILD_NUMBER_PREF);
+            return false;
+        }
+
+        if (mUm.hasUserRestriction(UserManager.DISALLOW_DEBUGGING_FEATURES)) {
+            // Route to active device admin to lift the debugging restriction.
+            if (mDebuggingFeaturesDisallowedAdmin != null
+                    && mDebuggingFeaturesDisallowedAdmin.component != null) {
+                final Intent requestDebugFeatures = new Intent()
+                        .setPackage(mDebuggingFeaturesDisallowedAdmin.component.getPackageName())
+                        .setAction("com.android.settings.action.REQUEST_DEBUG_FEATURES");
+                final ResolveInfo resolveInfo = mContext.getPackageManager().resolveActivity(
+                        requestDebugFeatures, 0);
+                if (resolveInfo != null) {
+                    mContext.startActivity(requestDebugFeatures);
+                    return false;
+                }
+            }
+            if (mDebuggingFeaturesDisallowedAdmin != null &&
+                    !mDebuggingFeaturesDisallowedBySystem) {
+                RestrictedLockUtils.sendShowAdminSupportDetailsIntent(mContext,
+                        mDebuggingFeaturesDisallowedAdmin);
+            }
+            mMetricsFeatureProvider.action(
+                    mContext, SettingsEnums.ACTION_SETTINGS_BUILD_NUMBER_PREF);
+            return false;
+        }
+
+        if (mDevHitCountdown > 0) {
+            mDevHitCountdown--;
+            if (mDevHitCountdown == 0 && !mProcessingLastDevHit) {
+                // Add 1 count back, then start password confirmation flow.
+                mDevHitCountdown++;
+
+                final String title = mContext
+                        .getString(R.string.unlock_set_unlock_launch_picker_title);
+                final ChooseLockSettingsHelper.Builder builder =
+                        new ChooseLockSettingsHelper.Builder(mActivity, mFragment);
+                mProcessingLastDevHit = builder
+                        .setRequestCode(REQUEST_CONFIRM_PASSWORD_FOR_DEV_PREF)
+                        .setTitle(title)
+                        .show();
+
+                if (!mProcessingLastDevHit) {
+                    enableDevelopmentSettings();
+                }
+                mMetricsFeatureProvider.action(
+                        mMetricsFeatureProvider.getAttribution(mActivity),
+                        MetricsEvent.FIELD_SETTINGS_BUILD_NUMBER_DEVELOPER_MODE_ENABLED,
+                        mFragment.getMetricsCategory(),
+                        null,
+                        mProcessingLastDevHit ? 0 : 1);
+            } else if (mDevHitCountdown > 0
+                    && mDevHitCountdown < (TAPS_TO_BE_A_DEVELOPER - 2)) {
+                if (mDevHitToast != null) {
+                    mDevHitToast.cancel();
+                }
+                mDevHitToast = Toast.makeText(mContext,
+                        StringUtil.getIcuPluralsString(mContext, mDevHitCountdown,
+                                R.string.show_dev_countdown_cm),
+                        Toast.LENGTH_SHORT);
+                mDevHitToast.show();
+            }
+
+            mMetricsFeatureProvider.action(
+                    mMetricsFeatureProvider.getAttribution(mActivity),
+                    MetricsEvent.FIELD_SETTINGS_BUILD_NUMBER_DEVELOPER_MODE_ENABLED,
+                    mFragment.getMetricsCategory(),
+                    null,
+                    0);
+        } else if (mDevHitCountdown < 0) {
+            if (mDevHitToast != null) {
+                mDevHitToast.cancel();
+            }
+            Random randomInsult = new Random();
+            final int toasts = randomInsult.nextInt(insults.length);
+            mDevHitToast = Toast.makeText(mContext, insults[toasts],
+                    Toast.LENGTH_LONG);
+            mDevHitToast.show();
+            mMetricsFeatureProvider.action(
+                    mMetricsFeatureProvider.getAttribution(mActivity),
+                    MetricsEvent.FIELD_SETTINGS_BUILD_NUMBER_DEVELOPER_MODE_ENABLED,
+                    mFragment.getMetricsCategory(),
+                    null,
+                    1);
+        }
+        return true;
+    }
+
+    /**
+     * Handles password confirmation result.
+     *
+     * @return if activity result is handled.
+     */
+    public boolean onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != REQUEST_CONFIRM_PASSWORD_FOR_DEV_PREF
+                && requestCode != REQUEST_IDENTITY_CHECK_FOR_DEV_PREF) {
+            return false;
+        }
+        if (requestCode == REQUEST_CONFIRM_PASSWORD_FOR_DEV_PREF
+                && resultCode == Activity.RESULT_OK) {
+            final int userId = mContext.getUserId();
+            final Utils.BiometricStatus biometricAuthStatus =
+                    Utils.requestBiometricAuthenticationForMandatoryBiometrics(mContext,
+                            false /* biometricsAuthenticationRequested */,
+                            userId);
+            if (biometricAuthStatus != Utils.BiometricStatus.NOT_ACTIVE) {
+                Utils.launchBiometricPromptForMandatoryBiometrics(mFragment,
+                        REQUEST_IDENTITY_CHECK_FOR_DEV_PREF,
+                        userId, false /* hideBackground */);
+            } else {
+                enableDevelopmentSettings();
+            }
+        } else if (requestCode == REQUEST_IDENTITY_CHECK_FOR_DEV_PREF) {
+            if (resultCode == Activity.RESULT_OK) {
+                enableDevelopmentSettings();
+            } else if (resultCode
+                    == ConfirmDeviceCredentialActivity.BIOMETRIC_LOCKOUT_ERROR_RESULT) {
+                IdentityCheckBiometricErrorDialog.showBiometricErrorDialog(mFragment.getActivity(),
+                        Utils.BiometricStatus.LOCKOUT, true /* twoFactorAuthentication */);
+            }
+        }
+        mProcessingLastDevHit = false;
+        return true;
+    }
+
+    /**
+     * Enables development settings. Only call this after confirming password.
+     */
+    private void enableDevelopmentSettings() {
+        mDevHitCountdown = 0;
+        mProcessingLastDevHit = false;
+        DevelopmentSettingsEnabler.setDevelopmentSettingsEnabled(mContext, true);
+        if (mDevHitToast != null) {
+            mDevHitToast.cancel();
+        }
+        mDevHitToast = Toast.makeText(mContext, R.string.show_dev_on_cm,
+                Toast.LENGTH_LONG);
+        mDevHitToast.show();
+
+        FeatureFactory.getFeatureFactory().getSearchFeatureProvider().sendPreIndexIntent(mContext);
+    }
+
+    @VisibleForTesting
+    protected boolean isUserAMonkey() {
+        return ActivityManager.isUserAMonkey();
+    }
+}
